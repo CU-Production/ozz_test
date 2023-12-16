@@ -2,10 +2,12 @@
 #define SOKOL_GLCORE33
 #include "sokol_app.h"
 #include "sokol_gfx.h"
-#include "sokol_fetch.h"
 #include "sokol_time.h"
 #include "sokol_log.h"
 #include "sokol_glue.h"
+
+#define SOKOL_GL_IMPL
+#include "util/sokol_gl.h"
 
 #include "imgui.h"
 #define SOKOL_IMGUI_IMPL
@@ -114,6 +116,8 @@ static struct {
         int joint_texture_scale;
         simgui_image_t joint_texture;
     } ui;
+    bool debug_draw_skel;
+    int debug_draw_index;
 } state;
 
 // instance data buffer;
@@ -128,6 +132,9 @@ static void skel_data_loaded(const std::string& filename);
 static void anim_data_loaded(const std::string& filename);
 static void mesh_data_loaded(const std::string& filename);
 
+static void eval_animation(int debug_draw_idx);
+static void draw_skeleton(int debug_draw_idx);
+
 static void init(void) {
     state.ozz = std::make_unique<ozz_t>();
     state.num_instances = 1;
@@ -141,16 +148,14 @@ static void init(void) {
     sgdesc.logger.func = slog_func;
     sg_setup(&sgdesc);
 
+    // setup sokol-gl
+    sgl_desc_t sgldesc = { };
+    sgldesc.sample_count = sapp_sample_count();
+    sgldesc.logger.func = slog_func;
+    sgl_setup(&sgldesc);
+
     // setup sokol-time
     stm_setup();
-
-    // setup sokol-fetch
-    sfetch_desc_t sfdesc = { };
-    sfdesc.max_requests = 3;
-    sfdesc.num_channels = 1;
-    sfdesc.num_lanes = 3;
-    sfdesc.logger.func = slog_func;
-    sfetch_setup(&sfdesc);
 
     // setup sokol-imgui
     simgui_desc_t imdesc = { };
@@ -341,8 +346,6 @@ static void update_joint_texture(void) {
 }
 
 static void frame(void) {
-    sfetch_dowork();
-
     const int fb_width = sapp_width();
     const int fb_height = sapp_height();
     state.time.frame_time_sec = sapp_frame_duration();
@@ -368,6 +371,12 @@ static void frame(void) {
         if (state.draw_enabled) {
             sg_draw(0, state.num_triangle_indices, state.num_instances);
         }
+
+        if (state.debug_draw_skel) {
+            eval_animation(state.debug_draw_index);
+            draw_skeleton(state.debug_draw_index);
+            sgl_draw();
+        }
     }
     simgui_render();
     sg_end_pass();
@@ -384,11 +393,111 @@ static void input(const sapp_event* ev) {
 static void cleanup(void) {
     sg_imgui_discard(&state.ui.sgimgui);
     simgui_shutdown();
-    sfetch_shutdown();
+    sgl_shutdown();
     sg_shutdown();
 
     // free C++ objects early, otherwise ozz-animation complains about memory leaks
     state.ozz = nullptr;
+}
+
+static void eval_animation(int debug_draw_idx) {
+    // convert current time to animation ration (0.0 .. 1.0)
+    const float anim_duration = state.ozz->animation.duration();
+    const int instance = debug_draw_idx;
+    const float anim_ratio = fmodf(((float)state.time.abs_time_sec + (instance*0.1f)) / anim_duration, 1.0f);
+
+    // sample animation
+    ozz::animation::SamplingJob sampling_job;
+    sampling_job.animation = &state.ozz->animation;
+    sampling_job.cache = &state.ozz->cache;
+    sampling_job.ratio = anim_ratio;
+    sampling_job.output = make_span(state.ozz->local_matrices);
+    sampling_job.Run();
+
+    // convert joint matrices from local to model space
+    ozz::animation::LocalToModelJob ltm_job;
+    ltm_job.skeleton = &state.ozz->skeleton;
+    ltm_job.input = make_span(state.ozz->local_matrices);
+    ltm_job.output = make_span(state.ozz->model_matrices);
+    ltm_job.Run();
+}
+
+static void draw_vec(const ozz::math::SimdFloat4& vec) {
+    sgl_v3f(ozz::math::GetX(vec), ozz::math::GetY(vec), ozz::math::GetZ(vec));
+}
+
+static void draw_line(const ozz::math::SimdFloat4& v0, const ozz::math::SimdFloat4& v1) {
+    draw_vec(v0);
+    draw_vec(v1);
+}
+
+// this draws a wireframe 3d rhombus between the current and parent joints
+static void draw_joint(int joint_index, int parent_joint_index, ozz::math::SimdFloat4 global_offset = {0, 0, 0, 0}) {
+    if (parent_joint_index < 0) {
+        return;
+    }
+
+    using namespace ozz::math;
+
+    const Float4x4& m0 = state.ozz->model_matrices[joint_index];
+    const Float4x4& m1 = state.ozz->model_matrices[parent_joint_index];
+
+    const SimdFloat4 p0 = m0.cols[3] + global_offset;
+    const SimdFloat4 p1 = m1.cols[3] + global_offset;
+    const SimdFloat4 ny = m1.cols[1];
+    const SimdFloat4 nz = m1.cols[2];
+
+    const SimdFloat4 len = SplatX(Length3(p1 - p0)) * simd_float4::Load1(0.1f);
+
+    const SimdFloat4 pmid = p0 + (p1 - p0) * simd_float4::Load1(0.66f);
+    const SimdFloat4 p2 = pmid + ny * len;
+    const SimdFloat4 p3 = pmid + nz * len;
+    const SimdFloat4 p4 = pmid - ny * len;
+    const SimdFloat4 p5 = pmid - nz * len;
+
+    sgl_c3f(1.0f, 1.0f, 0.0f);
+    draw_line(p0, p2); draw_line(p0, p3); draw_line(p0, p4); draw_line(p0, p5);
+    draw_line(p1, p2); draw_line(p1, p3); draw_line(p1, p4); draw_line(p1, p5);
+    draw_line(p2, p3); draw_line(p3, p4); draw_line(p4, p5); draw_line(p5, p2);
+}
+
+static void draw_skeleton(int debug_draw_idx) {
+    sgl_defaults();
+    sgl_matrix_mode_projection();
+    sgl_load_matrix((const float*)&state.camera.proj);
+    sgl_matrix_mode_modelview();
+    sgl_load_matrix((const float*)&state.camera.view);
+
+    // initialize the character instance model-to-world matrices
+    int i=0, x=0, y=0, dx=0, dy=0;
+    for (; i < debug_draw_idx; i++, x+=dx, y+=dy) {
+        // at a corner?
+        if (abs(x) == abs(y)) {
+            if (x >= 0) {
+                // top-right corner: start a new ring
+                if (y >= 0) { x+=1; y+=1; dx=0; dy=-1; }
+                // bottom-right corner
+                else { dx=-1; dy=0; }
+            }
+            else {
+                // top-left corner
+                if (y >= 0) { dx=+1; dy=0; }
+                // bottom-left corner
+                else { dx=0; dy=+1; }
+            }
+        }
+    }
+    const float instance_offset_x = (float)x * 1.5f;
+    const float instance_offset_z = (float)y * 1.5f;
+    const ozz::math::SimdFloat4 globalOffset{instance_offset_x, 0, instance_offset_z, 0};
+
+    const int num_joints = state.ozz->skeleton.num_joints();
+    ozz::span<const int16_t> joint_parents = state.ozz->skeleton.joint_parents();
+    sgl_begin_lines();
+    for (int joint_index = 0; joint_index < num_joints; joint_index++) {
+        draw_joint(joint_index, joint_parents[joint_index], globalOffset);
+    }
+    sgl_end();
 }
 
 static void draw_ui(void) {
@@ -429,6 +538,13 @@ static void draw_ui(void) {
             ImGui::Separator();
             if (ImGui::Button("Toggle Joint Texture")) {
                 state.ui.joint_texture_shown = !state.ui.joint_texture_shown;
+            }
+            ImGui::Separator();
+            if (ImGui::Button("Toggle Instance skel")) {
+                state.debug_draw_skel = !state.debug_draw_skel;
+            }
+            if (state.debug_draw_skel) {
+                ImGui::SliderInt("Debug Index", &state.debug_draw_index, 0, state.num_instances-1);
             }
         }
     }
